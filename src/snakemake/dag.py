@@ -1747,7 +1747,12 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
             self._priority[job] = Job.HIGHEST_PRIORITY
 
     def update_groups(self):
-        groups = dict()
+        # This runs whenever the DAG is postprocessed. Group jobs are cached by
+        # their set of jobs, so build connected components as plain sets and
+        # only create group jobs from the final sets; never change a group job
+        # after it was created.
+        previous_groups = set(self._group.values())
+        components = {}
         for job in self.needrun_jobs():
             if job.group is None:
                 continue
@@ -1755,37 +1760,41 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
             # BFS into depending needrun jobs if in same group
             # Note: never go up here (into depending), because it may contain
             # jobs that have been sorted out due to e.g. ruleorder.
-            group = self.group_job_factory.new(
-                job.group,
-                (
-                    job
-                    for job in self.bfs(self._dependencies, job, stop=stop)
-                    if self.needrun(job)
-                ),
-                self.workflow.global_resources,
-            )
+            component = {
+                j
+                for j in self.bfs(self._dependencies, job, stop=stop)
+                if self.needrun(j)
+            }
 
-            # merge with previously determined groups if present
-            for j in group:
-                if j in groups:
-                    other = groups[j]
-                    other.merge(group)
-                    group = other
+            # merge with previously determined components if present
+            for j in list(component):
+                other = components.get(j)
+                if other is not None and other is not component:
+                    other |= component
+                    component = other
             # update assignment
-            for j in group:
-                # Since groups might have been merged, we need
-                # to update each job j in group.
-                groups[j] = group
+            for j in component:
+                # Since components might have been merged, we need
+                # to update each job j in component.
+                components[j] = component
+
+        component_groups = [
+            self._new_group_job(component)
+            for component in {id(c): c for c in components.values()}.values()
+        ]
 
         # check if all groups are valid
-        for group in set(groups.values()):
+        for group in component_groups:
             self.validate_group(group)
 
-        self._group = groups
-
-        self._update_group_components()
+        self._group = self._span_group_components(component_groups, previous_groups)
 
         self._check_groups()
+
+    def _new_group_job(self, jobs) -> GroupJob:
+        return self.group_job_factory.new(
+            next(iter(jobs)).group, jobs, self.workflow.global_resources
+        )
 
     def validate_group(self, group: GroupJob) -> None:
         for job in group.jobs:
@@ -1832,27 +1841,62 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
                     "of the same rule with different group assignments."
                 )
 
-    def _update_group_components(self):
-        # span connected components if requested
-        groups_by_id = defaultdict(set)
-        for group in self._group.values():
-            groups_by_id[group.groupid].add(group)
-        for groupid, conn_components in groups_by_id.items():
+    def _span_group_components(self, component_groups, previous_groups):
+        """Return the group job of each grouped job.
+
+        Connected components are combined into group jobs of up to the requested
+        number of components. Group jobs from the previous update that still
+        consist of whole components are kept, so that ready and running group
+        jobs keep their identity when the DAG is postprocessed again.
+        """
+        groups = {}
+        components_by_id = defaultdict(list)
+        for component in component_groups:
+            components_by_id[component.groupid].append(component)
+        for groupid, conn_components in components_by_id.items():
             lookup_id = self.workflow.parent_groupids.get(groupid, groupid)
             n_components = self.workflow.group_settings.group_components.get(
                 lookup_id, 1
             )
+            spanned = conn_components
             if n_components > 1:
-                for chunk in group_into_chunks(n_components, conn_components):
-                    if len(chunk) > 1:
-                        primary = chunk[0]
-                        for secondary in chunk[1:]:
-                            primary.merge(secondary)
-                        for j in primary:
-                            self._group[j] = primary
-
-        for group in self._group.values():
-            group.finalize()
+                spanned = []
+                component_of = {
+                    job: component
+                    for component in conn_components
+                    for job in component.jobs
+                }
+                remaining = set(conn_components)
+                for previous in previous_groups:
+                    if previous.groupid != groupid:
+                        continue
+                    members = {component_of.get(job) for job in previous.jobs}
+                    if (
+                        None not in members
+                        and members <= remaining
+                        and sum(len(member) for member in members) == len(previous)
+                    ):
+                        spanned.append(previous)
+                        remaining -= members
+                # Chunk the other components in a stable order.
+                ordered = sorted(
+                    remaining,
+                    key=lambda component: min(self._jobid[j] for j in component.jobs),
+                )
+                for chunk in group_into_chunks(n_components, ordered):
+                    if len(chunk) == 1:
+                        spanned.append(chunk[0])
+                    else:
+                        spanned.append(
+                            self._new_group_job(
+                                frozenset(chain.from_iterable(c.jobs for c in chunk))
+                            )
+                        )
+            for group in spanned:
+                group.finalize()
+                for job in group.jobs:
+                    groups[job] = group
+        return groups
 
     def _check_groups(self):
         """Check whether all groups are valid."""

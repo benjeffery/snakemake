@@ -1596,6 +1596,34 @@ def test_multicomp_group_jobs():
 
 
 @skip_on_windows
+def test_group_components_after_checkpoint():
+    # The checkpoint output exists before the run, so the DAG is postprocessed
+    # twice before scheduling. Merging connected components must give the same
+    # group jobs both times instead of merging the cached group jobs again.
+    tmpdir = run(
+        dpath("test_group_components_checkpoint"),
+        cluster="./qsub",
+        group_components={"items": 2},
+        cleanup=False,
+    )
+    try:
+        ran = Path(tmpdir, "ran.log").read_text().splitlines()
+        # 8 items, each with two counts and one filter, run exactly once.
+        assert len(ran) == 24
+        assert len(set(ran)) == 24
+        submissions = Path(tmpdir, "qsub.log").read_text().splitlines()
+        sizes = [
+            line.count("count:") + line.count("filter:")
+            for line in submissions
+            if "count:" in line or "filter:" in line
+        ]
+        # Two components of three jobs per group job, each job submitted once.
+        assert sizes == [6, 6, 6, 6]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=ON_WINDOWS)
+
+
+@skip_on_windows
 def test_group_job_fail():
     run(dpath("test_group_job_fail"), cluster="./qsub", shouldfail=True)
 

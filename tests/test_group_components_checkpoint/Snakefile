@@ -1,0 +1,52 @@
+# Grouped per-item jobs behind a checkpoint whose output already exists, so
+# the DAG is postprocessed twice before scheduling. The test merges two
+# connected components per group job and checks that every grouped job runs
+# once, in submissions of at most two components.
+
+
+rule all:
+    input:
+        "summary.txt",
+
+
+checkpoint select:
+    output:
+        "selected.txt",
+    shell:
+        "seq 1 8 > {output}"
+
+
+def selected_items(wildcards):
+    with open(checkpoints.select.get().output[0]) as f:
+        items = [line.strip() for line in f if line.strip()]
+    return expand("filtered/{item}.txt", item=items)
+
+
+rule count:
+    output:
+        "counts/{kind}/{item}.txt",
+    group:
+        "items"
+    shell:
+        "echo count {wildcards.kind} {wildcards.item} >> ran.log && touch {output}"
+
+
+rule filter:
+    input:
+        reads="counts/reads/{item}.txt",
+        assembly="counts/assembly/{item}.txt",
+    output:
+        "filtered/{item}.txt",
+    group:
+        "items"
+    shell:
+        "echo filter {wildcards.item} >> ran.log && echo {wildcards.item} > {output}"
+
+
+rule summary:
+    input:
+        selected_items,
+    output:
+        "summary.txt",
+    shell:
+        "cat {input} > {output}"
