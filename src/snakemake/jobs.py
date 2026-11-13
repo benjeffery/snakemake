@@ -1381,10 +1381,6 @@ class GroupJob(AbstractJob, GroupJobExecutorInterface, GroupJobSchedulerInterfac
         for job in self.jobs:
             await job.retrieve_storage_input()
 
-    def merge(self, other):
-        assert other.groupid == self.groupid
-        self.jobs = self.jobs | other.jobs
-
     def finalize(self):
         if not self.is_toposorted:
             self._toposorted = [
